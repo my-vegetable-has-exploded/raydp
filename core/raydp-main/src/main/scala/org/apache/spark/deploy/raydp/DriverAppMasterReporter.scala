@@ -57,42 +57,51 @@ object DriverAppMasterReporter extends Logging {
       false
     } else {
       val binding = synchronized {
-        if (!reported.compareAndSet(false, true)) None
+        if (reported.get()) None
         else Some((appId, masterHandle))
       }
       binding match {
         case None => false
         case Some((currentAppId, currentMasterHandle)) =>
-          try {
-            if (currentAppId != null && currentMasterHandle != null) {
-              RayAppMasterUtils.finishApplication(
+          if (currentAppId == null || currentMasterHandle == null) {
+            logWarning("Skip reporting terminal application state because AppMaster binding " +
+              "is incomplete.")
+            false
+          } else {
+            try {
+              val accepted = RayAppMasterUtils.finishApplication(
                 currentMasterHandle,
                 currentAppId,
                 snapshot.state.toString,
                 snapshot.exitCode,
                 snapshot.diagnostics)
-            } else {
-              logWarning("Skip reporting terminal application state because AppMaster binding " +
-                "is incomplete.")
-            }
-          } catch {
-            case NonFatal(e) =>
-              logWarning("Failed to report terminal application state to AppMaster", e)
-          } finally {
-            if (currentMasterHandle != null) {
-              try {
-                RayAppMasterUtils.stopAppMaster(currentMasterHandle)
-              } catch {
-                case NonFatal(e) =>
-                  logWarning("Failed to stop AppMaster during driver cleanup", e)
+
+              if (!accepted) {
+                logWarning("Terminal application state report was not accepted by AppMaster; " +
+                  "keeping reporter state for a later retry.")
+                false
+              } else {
+                reported.set(true)
+                if (currentMasterHandle != null) {
+                  try {
+                    RayAppMasterUtils.stopAppMaster(currentMasterHandle)
+                  } catch {
+                    case NonFatal(e) =>
+                      logWarning("Failed to stop AppMaster during driver cleanup", e)
+                  }
+                }
+                synchronized {
+                  appId = null
+                  masterHandle = null
+                }
+                true
               }
-            }
-            synchronized {
-              appId = null
-              masterHandle = null
+            } catch {
+              case NonFatal(e) =>
+                logWarning("Failed to report terminal application state to AppMaster", e)
+                false
             }
           }
-          true
       }
     }
   }

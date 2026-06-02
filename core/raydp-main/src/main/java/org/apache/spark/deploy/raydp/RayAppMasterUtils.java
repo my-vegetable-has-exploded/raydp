@@ -43,6 +43,7 @@ public class RayAppMasterUtils {
               .substring(SparkOnRayConfigs.SPARK_MASTER_ACTOR_RESOURCE_PREFIX.length() + 1);
       creator.setResource(resourceName, resource.getValue());
     }
+    creator.setMaxTaskRetries(3);
 
     return creator.remote();
   }
