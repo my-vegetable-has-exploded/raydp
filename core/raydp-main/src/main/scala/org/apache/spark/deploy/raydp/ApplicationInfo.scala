@@ -19,7 +19,7 @@ package org.apache.spark.deploy.raydp
 
 import java.util.Date
 
-import scala.collection.mutable.{ArrayBuffer, HashMap}
+import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
 
 import io.ray.api.ActorHandle
 
@@ -32,6 +32,9 @@ import org.apache.spark.rpc.{RpcAddress, RpcEndpointRef}
 
 case class ExecutorDesc(
     executorId: String,
+    // Ray actors keep their original actor id across restarts, while Spark assigns a new
+    // executor id for each restarted executor generation.
+    actorId: String,
     cores: Int,
     memoryPerExecutorMB: Int,
     resources: Map[String, ResourceInformation]) {
@@ -56,6 +59,10 @@ private[spark] class ApplicationInfo(
   private var nextExecutorId: Int = _
   // this only count those registered executors and minus removed executors
   private var registeredExecutors: Int = 0
+  // Desired executor target comes from the Spark driver. Actor slots track the Ray actors
+  // AppMaster still owns, independent of transient Spark executor generations.
+  private var desiredExecutors: Int = _
+  private var actorSlots: HashSet[String] = _
 
   init()
 
@@ -66,17 +73,48 @@ private[spark] class ApplicationInfo(
     executorIdToHandler = new HashMap[String, ActorHandle[RayDPExecutor]]
     endTime = -1L
     nextExecutorId = 0
+    desiredExecutors = desc.numExecutors
+    actorSlots = new HashSet[String]
     removedExecutors = new ArrayBuffer[ExecutorDesc]
   }
 
   def addPendingRegisterExecutor(
       executorId: String,
+      actorId: String,
       handler: ActorHandle[RayDPExecutor],
       cores: Int,
       memoryInMB: Int): Unit = {
-    val desc = ExecutorDesc(executorId, cores, memoryInMB, null)
+    // Adding a pending executor also declares that its Ray actor slot is still active.
+    // For restarted executors, actorId points back to the original named Ray actor.
+    actorSlots += actorId
+    val desc = ExecutorDesc(executorId, actorId, cores, memoryInMB, null)
     executors(executorId) = desc
     executorIdToHandler(executorId) = handler
+  }
+
+  def updateDesiredExecutors(numExecutors: Int): Unit = {
+    desiredExecutors = math.max(0, numExecutors)
+  }
+
+  def hasActorSlot(actorId: String): Boolean = {
+    actorSlots.contains(actorId)
+  }
+
+  def actorSlotCount: Int = {
+    actorSlots.size
+  }
+
+  def numActorsToAdd: Int = {
+    math.max(0, desiredExecutors - actorSlots.size)
+  }
+
+  // Compatibility view for ObjectStoreWriter: map restarted Spark executor ids back to
+  // the original Ray actor ids used in named actor lookup.
+  def getRestartedExecutors: Map[String, String] = {
+    executors.collect {
+      case (executorId, desc) if desc.actorId != executorId =>
+        executorId -> desc.actorId
+    }.toMap
   }
 
   def registerExecutor(executorId: String): Boolean = {
@@ -117,6 +155,9 @@ private[spark] class ApplicationInfo(
       executors -= executorId
       coresGranted -= exec.cores
       if (shutdownActor) {
+        // Only explicit Spark/AppMaster shutdown releases the Ray actor slot. A disconnect caused
+        // by actor failure keeps the slot so Ray can restart it and register a new executor id.
+        actorSlots -= exec.actorId
         // Previously we used to exitExecutor for all scenarios, but it will cause
         // the following issue when a executor is down because of OOM issue:
         // - Executor E1 dies at T0 lets say because of OOm
