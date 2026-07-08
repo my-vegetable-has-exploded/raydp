@@ -203,21 +203,21 @@ class RayAppMaster(host: String,
         }
         context.reply(success)
 
-      case RequestAddPendingRestartedExecutor(executorId) =>
+      case RequestAddPendingRestartedExecutor(actorId) =>
         val cores = appInfo.desc.coresPerExecutor.getOrElse(1)
         val memory = appInfo.desc.memoryPerExecutorMB
         // ray actor will restart using the old ID
-        val handlerOpt = Ray.getActor("raydp-executor-" + executorId)
+        val handlerOpt = Ray.getActor("raydp-executor-" + actorId)
         if (!handlerOpt.isPresent) {
           context.reply(AddPendingRestartedExecutorReply(None))
-        } else if (!appInfo.hasActorSlot(executorId)) {
+        } else if (!appInfo.actorIdToHandle.contains(actorId)) {
           // The actor may still be visible in Ray after Spark has scaled the slot down.
           // Do not allow a late restart request to recreate a removed executor.
           context.reply(AddPendingRestartedExecutorReply(None))
         } else {
           val newExecutorId = s"${appInfo.getNextExecutorId()}"
           val handler = handlerOpt.get.asInstanceOf[ActorHandle[RayDPExecutor]]
-          appInfo.addPendingRegisterExecutor(newExecutorId, executorId, handler, cores, memory)
+          appInfo.addPendingRegisterExecutor(newExecutorId, actorId, handler, cores, memory)
           context.reply(AddPendingRestartedExecutorReply(Some(newExecutorId)))
         }
     }
