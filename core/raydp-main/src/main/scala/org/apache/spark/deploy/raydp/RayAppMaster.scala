@@ -201,6 +201,7 @@ class RayAppMaster(host: String,
             success = false
           }
         }
+        reconcileExecutors()
         context.reply(success)
 
       case RequestAddPendingRestartedExecutor(actorId) =>
