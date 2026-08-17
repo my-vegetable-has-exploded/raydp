@@ -84,10 +84,11 @@ class RayAppMaster(host: String,
   }
 
   def getRestartedExecutors(): java.util.Map[String, String] = {
-    if (appMasterEndpoint == null) {
+    val endpoint = appMasterEndpoint
+    if (endpoint == null) {
       Map.empty[String, String].asJava
     } else {
-      appMasterEndpoint.getRestartedExecutors().asJava
+      endpoint.getRestartedExecutors().asJava
     }
   }
 
