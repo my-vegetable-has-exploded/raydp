@@ -84,11 +84,11 @@ class RayAppMaster(host: String,
   }
 
   def getRestartedExecutors(): java.util.Map[String, String] = {
-    val endpoint = appMasterEndpoint
-    if (endpoint == null) {
+    val endpointRef = endpoint
+    if (endpointRef == null) {
       Map.empty[String, String].asJava
     } else {
-      endpoint.getRestartedExecutors().asJava
+      endpointRef.askSync[Map[String, String]](GetRestartedExecutors).asJava
     }
   }
 
@@ -105,7 +105,6 @@ class RayAppMaster(host: String,
     if (rpcEnv != null) {
       rpcEnv.shutdown()
       endpoint = null
-      appMasterEndpoint = null
       rpcEnv = null
     }
     0
@@ -138,14 +137,6 @@ class RayAppMaster(host: String,
       }
 
     private var currentBundleIndex: Int = 0
-
-    def getRestartedExecutors(): Map[String, String] = {
-      if (appInfo == null) {
-        Map.empty
-      } else {
-        appInfo.getRestartedExecutors
-      }
-    }
 
     override def receive: PartialFunction[Any, Unit] = {
       case RegisterApplication(appDescription: ApplicationDescription, driver: RpcEndpointRef) =>
@@ -187,6 +178,9 @@ class RayAppMaster(host: String,
       case ExecutorStarted(executorId) =>
         appInfo.markExecutorStarted(executorId, context.senderAddress)
         context.reply(true)
+
+      case GetRestartedExecutors =>
+        context.reply(if (appInfo == null) Map.empty else appInfo.getRestartedExecutors)
 
       case RequestExecutors(appId, requestedTotal) =>
         assert(appInfo != null && appInfo.id == appId)
@@ -271,6 +265,8 @@ class RayAppMaster(host: String,
     private def reconcileExecutors(): Unit = {
       // Reconcile against Ray actor slots, not registered Spark executor generations.
       // Restarted actors keep the same slot and only receive a new Spark executor id.
+      // DesiredExecutors is the single source of truth and the only bound on actor provisioning.
+      // So any future bug in spark's desiredExecutors tracking could provision unbounded actors.
       (0 until appInfo.numActorsToAdd).foreach { _ =>
         requestNewExecutor()
       }
