@@ -58,8 +58,6 @@ private[spark] class ApplicationInfo(
   var coresGranted: Int = _
   var endTime: Long = _
   private var nextExecutorId: Int = _
-  // this only count those registered executors and minus removed executors
-  private var registeredExecutors: Int = 0
   // Desired executor target comes from the Spark driver. Actor handles track the Ray actor
   // slots AppMaster still owns, independent of transient Spark executor generations.
   private var desiredExecutors: Int = _
@@ -116,7 +114,6 @@ private[spark] class ApplicationInfo(
         false
       } else {
         executors(executorId).registered = true
-        registeredExecutors += 1
         true
       }
     } else {
@@ -140,9 +137,6 @@ private[spark] class ApplicationInfo(
   def kill(executorId: String, shutdownActor: Boolean): Boolean = {
     if (executors.contains(executorId)) {
       val exec = executors(executorId)
-      if (exec.registered) {
-        registeredExecutors -= 1
-      }
       removedExecutors += exec
       executors -= executorId
       executorIdToActorId -= executorId
@@ -171,14 +165,6 @@ private[spark] class ApplicationInfo(
   def getExecutorHandler(
       executorId: String): Option[ActorHandle[RayDPExecutor]] = {
     executorIdToActorId.get(executorId).flatMap(actorIdToHandle.get)
-  }
-
-  def remainingUnRegisteredExecutors(): Int = {
-    desc.numExecutors - registeredExecutors
-  }
-
-  def currentExecutors(): Int = {
-    registeredExecutors
   }
 
   def getNextExecutorId(): Int = {

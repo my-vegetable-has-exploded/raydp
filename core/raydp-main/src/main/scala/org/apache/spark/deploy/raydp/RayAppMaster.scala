@@ -44,7 +44,6 @@ class RayAppMaster(host: String,
                    port: Int,
                    actorExtraClasspath: String) extends Serializable with Logging {
   private var endpoint: RpcEndpointRef = _
-  private var appMasterEndpoint: RayAppMasterEndpoint = _
   private var rpcEnv: RpcEnv = _
   private val conf: SparkConf = new SparkConf()
 
@@ -71,7 +70,7 @@ class RayAppMaster(host: String,
       numUsableCores = 0,
       clientMode = false)
     // register endpoint
-    appMasterEndpoint = new RayAppMasterEndpoint(rpcEnv)
+    val appMasterEndpoint = new RayAppMasterEndpoint(rpcEnv)
     endpoint = rpcEnv.setupEndpoint(RayAppMaster.ENDPOINT_NAME, appMasterEndpoint)
   }
 
