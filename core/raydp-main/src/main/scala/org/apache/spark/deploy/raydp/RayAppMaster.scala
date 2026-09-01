@@ -205,7 +205,7 @@ class RayAppMaster(host: String,
         val handlerOpt = Ray.getActor("raydp-executor-" + actorId)
         if (!handlerOpt.isPresent) {
           context.reply(AddPendingRestartedExecutorReply(None))
-        } else if (!appInfo.actorIdToHandle.contains(actorId)) {
+        } else if (!appInfo.actorSlots.contains(actorId)) {
           // The actor may still be visible in Ray after Spark has scaled the slot down.
           // Do not allow a late restart request to recreate a removed executor.
           context.reply(AddPendingRestartedExecutorReply(None))

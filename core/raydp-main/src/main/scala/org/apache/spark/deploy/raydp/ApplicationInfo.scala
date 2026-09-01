@@ -39,7 +39,13 @@ case class ExecutorDesc(
     memoryPerExecutorMB: Int,
     resources: Map[String, ResourceInformation]) {
   var registered: Boolean = false
+  var address: Option[RpcAddress] = None
 }
+
+private[spark] class ExecutorActorSlot(
+    var handle: ActorHandle[RayDPExecutor],
+    var currentExecutorId: Option[String],
+    var previousExecutorId: Option[String])
 
 private[spark] class ApplicationInfo(
     val startTime: Long,
@@ -52,8 +58,9 @@ private[spark] class ApplicationInfo(
   var state: ApplicationState.Value = _
   var executors: HashMap[String, ExecutorDesc] = _
   var addressToExecutorId: HashMap[RpcAddress, String] = _
+  // Resolves both current executor ids and the previous-generation tombstone to an actor slot.
   var executorIdToActorId: HashMap[String, String] = _
-  var actorIdToHandle: HashMap[String, ActorHandle[RayDPExecutor]] = _
+  var actorSlots: HashMap[String, ExecutorActorSlot] = _
   var removedExecutors: ArrayBuffer[ExecutorDesc] = _
   var coresGranted: Int = _
   var endTime: Long = _
@@ -69,7 +76,7 @@ private[spark] class ApplicationInfo(
     executors = new HashMap[String, ExecutorDesc]
     addressToExecutorId = new HashMap[RpcAddress, String]
     executorIdToActorId = new HashMap[String, String]
-    actorIdToHandle = new HashMap[String, ActorHandle[RayDPExecutor]]
+    actorSlots = new HashMap[String, ExecutorActorSlot]
     endTime = -1L
     nextExecutorId = 0
     desiredExecutors = desc.numExecutors
@@ -84,9 +91,13 @@ private[spark] class ApplicationInfo(
       memoryInMB: Int): Unit = {
     // Adding a pending executor also declares that its Ray actor slot is still active.
     // For restarted executors, actorId points back to the original named Ray actor.
-    actorIdToHandle(actorId) = handler
+    val slot = actorSlots.getOrElseUpdate(
+      actorId, new ExecutorActorSlot(handler, None, None))
+    slot.handle = handler
+    slot.currentExecutorId = Some(executorId)
     val desc = ExecutorDesc(executorId, actorId, cores, memoryInMB, null)
     executors(executorId) = desc
+    // Keep the previous generation mapping until the next disconnect or explicit actor shutdown.
     executorIdToActorId(executorId) = actorId
   }
 
@@ -95,7 +106,7 @@ private[spark] class ApplicationInfo(
   }
 
   def numActorsToAdd: Int = {
-    math.max(0, desiredExecutors - actorIdToHandle.size)
+    math.max(0, desiredExecutors - actorSlots.size)
   }
 
   // Compatibility view for ObjectStoreWriter: map restarted Spark executor ids back to
@@ -123,28 +134,33 @@ private[spark] class ApplicationInfo(
   }
 
   def markExecutorStarted(executorId: String, address: RpcAddress): Unit = {
-    addressToExecutorId(address) = executorId
-  }
-
-  def kill(address: RpcAddress, shutdownActor: Boolean): Boolean = {
-    if (addressToExecutorId.contains(address)) {
-      kill(addressToExecutorId(address), shutdownActor)
-    } else {
-      false
+    executors.get(executorId).foreach { exec =>
+      exec.address = Some(address)
+      addressToExecutorId(address) = executorId
     }
   }
 
+  def kill(address: RpcAddress, shutdownActor: Boolean): Boolean = {
+    addressToExecutorId.get(address).exists(kill(_, shutdownActor))
+  }
+
   def kill(executorId: String, shutdownActor: Boolean): Boolean = {
-    if (executors.contains(executorId)) {
-      val exec = executors(executorId)
-      removedExecutors += exec
-      executors -= executorId
-      executorIdToActorId -= executorId
-      coresGranted -= exec.cores
+    val actorIdOpt = executorIdToActorId.get(executorId)
+
+    actorIdOpt.foreach { actorId =>
       if (shutdownActor) {
+        // executorId may be a tombstone. Retire every generation mapped to the same actor so a
+        // late kill cannot leave its current generation or actor slot behind.
+        val slotOpt = actorSlots.remove(actorId)
+        val executorIds = slotOpt.map { slot =>
+          Set(executorId) ++ slot.currentExecutorId ++ slot.previousExecutorId
+        }.getOrElse(Set(executorId))
+        executorIds.foreach { id =>
+          removeExecutorGeneration(id)
+          executorIdToActorId.remove(id)
+        }
         // Only explicit Spark/AppMaster shutdown releases the Ray actor slot. A disconnect caused
         // by actor failure keeps the slot so Ray can restart it and register a new executor id.
-        val handlerOpt = actorIdToHandle.remove(exec.actorId)
         // Previously we used to exitExecutor for all scenarios, but it will cause
         // the following issue when a executor is down because of OOM issue:
         // - Executor E1 dies at T0 lets say because of OOm
@@ -154,17 +170,34 @@ private[spark] class ApplicationInfo(
         // - The failed task (stop task) gets retried as there are task retries configured.
         // - The stop task gets fired on the new executor which got recovered
         // - The Recovered executor exits with status as user intended exit.
-        handlerOpt.foreach(handle => RayExecutorUtils.exitExecutor(handle))
+        slotOpt.foreach(slot => RayExecutorUtils.exitExecutor(slot.handle))
+      } else {
+        removeExecutorGeneration(executorId)
+        actorSlots.get(actorId).foreach { slot =>
+          if (slot.currentExecutorId.contains(executorId)) {
+            // Replace the older tombstone so restart history stays bounded to one generation.
+            slot.previousExecutorId.foreach(executorIdToActorId.remove)
+            slot.currentExecutorId = None
+            slot.previousExecutorId = Some(executorId)
+          }
+        }
+        executorIdToActorId(executorId) = actorId
       }
-      true
-    } else {
-      false
+    }
+    actorIdOpt.isDefined
+  }
+
+  private def removeExecutorGeneration(executorId: String): Unit = {
+    executors.remove(executorId).foreach { exec =>
+      removedExecutors += exec
+      coresGranted -= exec.cores
+      exec.address.foreach(addressToExecutorId.remove)
     }
   }
 
   def getExecutorHandler(
       executorId: String): Option[ActorHandle[RayDPExecutor]] = {
-    executorIdToActorId.get(executorId).flatMap(actorIdToHandle.get)
+    executorIdToActorId.get(executorId).flatMap(actorSlots.get).map(_.handle)
   }
 
   def getNextExecutorId(): Int = {
