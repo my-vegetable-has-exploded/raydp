@@ -183,7 +183,7 @@ private[spark] class ApplicationInfo(
             // - The failed task (stop task) gets retried as there are task retries configured.
             // - The stop task gets fired on the new executor which got recovered
             // - The Recovered executor exits with status as user intended exit.
-            slotOpt.foreach(slot => RayExecutorUtils.exitExecutor(slot.handle))
+            slotOpt.foreach(slot => exitExecutorActor(slot.handle))
             None
         }
       } else {
@@ -208,6 +208,12 @@ private[spark] class ApplicationInfo(
       coresGranted -= exec.cores
       exec.address.foreach(addressToExecutorId.remove)
     }
+  }
+
+  // Visible for testing. Shutting an executor down needs a live Ray actor handle, which unit
+  // tests cannot construct, so the Ray call is isolated behind this method.
+  protected def exitExecutorActor(handle: ActorHandle[RayDPExecutor]): Unit = {
+    RayExecutorUtils.exitExecutor(handle)
   }
 
   def getExecutorHandler(
