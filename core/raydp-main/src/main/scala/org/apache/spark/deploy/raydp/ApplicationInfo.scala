@@ -149,28 +149,43 @@ private[spark] class ApplicationInfo(
 
     actorIdOpt.foreach { actorId =>
       if (shutdownActor) {
-        // executorId may be a tombstone. Retire every generation mapped to the same actor so a
-        // late kill cannot leave its current generation or actor slot behind.
-        val slotOpt = actorSlots.remove(actorId)
-        val executorIds = slotOpt.map { slot =>
-          Set(executorId) ++ slot.currentExecutorId ++ slot.previousExecutorId
-        }.getOrElse(Set(executorId))
-        executorIds.foreach { id =>
-          removeExecutorGeneration(id)
-          executorIdToActorId.remove(id)
+        // One pass over the slot decides whether it survives this kill.
+        actorSlots.updateWith(actorId) {
+          // A tombstone whose actor has already re-registered refers to a generation Spark itself
+          // removed on disconnect. Spark tracks the newer generation as a separate executor, so a
+          // late kill for the retired id must not terminate it: drop only the tombstone and keep
+          // the slot so Spark can kill that generation through its own executor id.
+          case Some(slot) if slot.currentExecutorId.exists(_ != executorId) =>
+            executorIdToActorId.remove(executorId)
+            if (slot.previousExecutorId.contains(executorId)) {
+              slot.previousExecutorId = None
+            }
+            Some(slot)
+          // Otherwise no live generation remains, so retire every generation mapped to the actor
+          // and release the slot.
+          case slotOpt =>
+            val executorIds = slotOpt.map { slot =>
+              Set(executorId) ++ slot.currentExecutorId ++ slot.previousExecutorId
+            }.getOrElse(Set(executorId))
+            executorIds.foreach { id =>
+              removeExecutorGeneration(id)
+              executorIdToActorId.remove(id)
+            }
+            // Only explicit Spark/AppMaster shutdown releases the Ray actor slot. A disconnect
+            // caused by actor failure keeps the slot so Ray can restart it and register a new
+            // executor id.
+            // Previously we used to exitExecutor for all scenarios, but it will cause
+            // the following issue when a executor is down because of OOM issue:
+            // - Executor E1 dies at T0 lets say because of OOm
+            // - We try to kill it by firing stop call on E1 actor
+            // - Since the actor is not available, the stop task fails for E1
+            // - In the mean while, ray brings up the lost executor E1
+            // - The failed task (stop task) gets retried as there are task retries configured.
+            // - The stop task gets fired on the new executor which got recovered
+            // - The Recovered executor exits with status as user intended exit.
+            slotOpt.foreach(slot => RayExecutorUtils.exitExecutor(slot.handle))
+            None
         }
-        // Only explicit Spark/AppMaster shutdown releases the Ray actor slot. A disconnect caused
-        // by actor failure keeps the slot so Ray can restart it and register a new executor id.
-        // Previously we used to exitExecutor for all scenarios, but it will cause
-        // the following issue when a executor is down because of OOM issue:
-        // - Executor E1 dies at T0 lets say because of OOm
-        // - We try to kill it by firing stop call on E1 actor
-        // - Since the actor is not available, the stop task fails for E1
-        // - In the mean while, ray brings up the lost executor E1
-        // - The failed task (stop task) gets retried as there are task retries configured.
-        // - The stop task gets fired on the new executor which got recovered
-        // - The Recovered executor exits with status as user intended exit.
-        slotOpt.foreach(slot => RayExecutorUtils.exitExecutor(slot.handle))
       } else {
         removeExecutorGeneration(executorId)
         actorSlots.get(actorId).foreach { slot =>
