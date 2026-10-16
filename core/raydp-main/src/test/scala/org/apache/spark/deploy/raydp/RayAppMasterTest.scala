@@ -27,7 +27,12 @@ import org.junit.jupiter.api.Test
 import org.apache.spark.executor.RayDPExecutor
 import org.apache.spark.rpc.{RpcEndpointRef, RpcEnv}
 
+/**
+ * Exercises restart registration through Spark RPC without starting a Ray runtime.
+ * These tests check handle identity and slot bookkeeping, not native reference counting or GC.
+ */
 class RayAppMasterTest {
+  // Keep the real slot-removal logic, but record shutdowns instead of submitting Ray actor tasks.
   private class TestApplicationInfo extends ApplicationInfo(
       0L,
       "app-test",
@@ -47,12 +52,15 @@ class RayAppMasterTest {
     withApp { (app, endpoint) =>
       val owner = app.actorSlots("0").handle
       var previousId = "0"
+      // Each disconnect retires a Spark generation; the same Ray actor keeps slot "0".
       for (executorId <- Seq("1", "2")) {
         assertTrue(app.kill(previousId, shutdownActor = false))
         val reply = endpoint.askSync[AddPendingRestartedExecutorReply](
           RequestAddPendingRestartedExecutor("0"))
 
         assertEquals(Some(executorId), reply.newExecutorId)
+        // Matching actor IDs is insufficient: a lookup could return another wrapper for that
+        // actor. The AppMaster must keep the exact original owner handle reachable.
         assertSame(owner, app.actorSlots("0").handle)
         assertSame(owner, app.getExecutorHandler(executorId).get)
         assertEquals(Some(executorId), app.actorSlots("0").currentExecutorId)
@@ -71,6 +79,7 @@ class RayAppMasterTest {
   @Test
   def removedSlotRejectsLateRestartWithoutAllocatingAnExecutorId(): Unit = {
     withApp { (app, endpoint) =>
+      // Model scale-down after a disconnect: retire the generation, then release its slot.
       assertTrue(app.kill("0", shutdownActor = false))
       assertTrue(app.kill("0", shutdownActor = true))
       app.updateDesiredExecutors(0)
@@ -84,6 +93,7 @@ class RayAppMasterTest {
       assertTrue(app.executorIdToActorId.isEmpty)
       assertEquals(1, app.stoppedActors)
       assertEquals(0, app.numActorsToAdd)
+      // Only the initial executor consumed ID 0; a rejected request must not consume ID 1.
       assertEquals(1, app.getNextExecutorId())
     }
   }
@@ -92,6 +102,7 @@ class RayAppMasterTest {
   def unknownSlotRejectsRestartWithoutChangingExistingSlots(): Unit = {
     withApp { (app, endpoint) =>
       val owner = app.actorSlots("0").handle
+      // An unrelated actor must not acquire a slot or disturb the existing executor.
       val reply = endpoint.askSync[AddPendingRestartedExecutorReply](
         RequestAddPendingRestartedExecutor("unknown"))
 
@@ -100,6 +111,7 @@ class RayAppMasterTest {
       assertEquals(Set("0"), app.actorSlots.keySet.toSet)
       assertEquals(Set("0"), app.executors.keySet.toSet)
       assertEquals(Map("0" -> "0"), app.executorIdToActorId.toMap)
+      // Only the initial executor consumed ID 0; a rejected request must not consume ID 1.
       assertEquals(1, app.getNextExecutorId())
     }
   }
@@ -111,6 +123,8 @@ class RayAppMasterTest {
     val env = envField.get(master).asInstanceOf[RpcEnv]
     try {
       val endpoint = new master.RayAppMasterEndpoint(env)
+      // Seed the private application state directly: normal application registration would
+      // schedule real Ray actors, which is outside the scope of these RPC tests.
       val appField = endpoint.getClass.getDeclaredFields
         .find(_.getName.endsWith("appInfo")).get
       appField.setAccessible(true)
@@ -130,6 +144,8 @@ class RayAppMasterTest {
   }
 
   private def ownerHandle(): ActorHandle[RayDPExecutor] = {
+    // This handle is only an identity marker. Any actor invocation fails immediately, so an
+    // accidental dependency on native Ray operations cannot silently pass the test.
     val handler = new InvocationHandler {
       override def invoke(proxy: AnyRef, method: Method, args: Array[AnyRef]): AnyRef = {
         throw new UnsupportedOperationException("Unexpected actor call: " + method.getName)
